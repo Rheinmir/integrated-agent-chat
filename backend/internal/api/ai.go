@@ -1,11 +1,9 @@
-﻿package api
+package api
 
 import (
-	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -13,31 +11,34 @@ import (
 	"github.com/Rheinmir/integrated-agent-chat/internal/mcp"
 )
 
-// aiProvider is the single interface all AI providers must implement.
-type aiProvider interface {
-	initMessages(systemPrompt, userMsg string)
-	call(ctx context.Context, tools []mcp.Tool) (text string, calls []toolCall, tokIn, tokOut int, done bool, err error)
-	appendAssistant(text string, calls []toolCall)
-	appendToolResults(results []toolResult)
-	ModelID() string
-	Provider() string
-	SetSystemPrompt(p string)
+const aiSystemPromptBase = `You are a helpful AI assistant with persistent memory.
+You can remember facts about the user using the remember() tool,
+search memory with recall(), and delete facts with forget().
+After every tool call, ALWAYS write one sentence reporting the result to the user.
+Never return an empty response.`
+
+func (h *AIHandlers) aiSystemPrompt() string {
+	if h.DB == nil {
+		return aiSystemPromptBase
+	}
+	rows, err := h.DB.Query(
+		`SELECT key, value FROM agent_memory ORDER BY updated_at DESC LIMIT 8`)
+	if err != nil {
+		return aiSystemPromptBase
+	}
+	defer rows.Close()
+	var parts []string
+	for rows.Next() {
+		var k, v string
+		rows.Scan(&k, &v)
+		parts = append(parts, k+": "+v)
+	}
+	if len(parts) == 0 {
+		return aiSystemPromptBase
+	}
+	return aiSystemPromptBase + "\n\nWhat you remember about the user:\n- " + strings.Join(parts, "\n- ")
 }
 
-type toolCall struct {
-	ID    string
-	Name  string
-	Input map[string]any
-}
-
-type toolResult struct {
-	ID     string
-	Name   string
-	Output any
-	IsErr  bool
-}
-
-// AIHandlers holds all dependencies for the AI API surface.
 type AIHandlers struct {
 	AnthropicKey  string
 	GeminiKey     string
@@ -46,271 +47,366 @@ type AIHandlers struct {
 	DB            *sql.DB
 }
 
+type ChatMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
 type chatRequest struct {
-	Message string `json:"message"`
-	Model   string `json:"model"`
+	Message string        `json:"message"`
+	History []ChatMessage `json:"history"`
+	Model   string        `json:"model"`
 }
 
 type chatResponse struct {
-	Reply      string `json:"reply"`
-	Model      string `json:"model"`
-	Provider   string `json:"provider"`
-	TokensIn   int    `json:"tokensIn"`
-	TokensOut  int    `json:"tokensOut"`
-	Iterations int    `json:"iterations"`
+	Text      string           `json:"text"`
+	Actions   []map[string]any `json:"actions"`
+	Model     string           `json:"model"`
+	Provider  string           `json:"provider"`
+	TokensIn  int              `json:"tokens_in"`
+	TokensOut int              `json:"tokens_out"`
 }
 
-type memoryEntry struct {
-	Key       string `json:"key"`
-	Value     string `json:"value"`
-	UpdatedAt string `json:"updatedAt"`
+type toolCall struct {
+	ID    string
+	Name  string
+	Input map[string]any
 }
 
-type logEntry struct {
-	ID         int64  `json:"id"`
-	TS         string `json:"ts"`
-	Model      string `json:"model"`
-	Provider   string `json:"provider"`
-	UserMsg    string `json:"userMsg"`
-	Reply      string `json:"reply"`
-	TokIn      int    `json:"tokIn"`
-	TokOut     int    `json:"tokOut"`
-	Iterations int    `json:"iterations"`
-	Failure    bool   `json:"failure"`
+// aiProvider is the single interface all providers must implement.
+// msgs is opaque state passed through the agentic loop — each provider owns its message format.
+type aiProvider interface {
+	initMessages(history []ChatMessage, userMsg string) any
+	call(msgs any, tools []mcp.Tool) (text string, calls []toolCall, tokIn int, tokOut int, done bool, err error)
+	appendAssistant(msgs any, text string, calls []toolCall) any
+	appendToolResults(msgs any, calls []toolCall, results []string) any
+	ModelID() string
+	Provider() string
+	SetSystemPrompt(s string)
 }
 
+// toolStatusMessages maps tool names to short live-status strings shown in the UI.
+// Customise for your domain.
+var toolStatusMessages = map[string]string{
+	"remember": "Saving to memory...",
+	"recall":   "Searching memory...",
+	"forget":   "Removing from memory...",
+}
+
+// POST /api/ai/chat — blocking JSON response
 func (h *AIHandlers) chat(w http.ResponseWriter, r *http.Request) {
 	var req chatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid request body", http.StatusBadRequest)
+		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	if req.Message == "" {
-		http.Error(w, "message is required", http.StatusBadRequest)
+		http.Error(w, "message required", http.StatusBadRequest)
 		return
 	}
-	if req.Model == "" {
-		req.Model = "claude-sonnet-4-5"
-	}
-
-	ctx := r.Context()
-	systemPrompt := h.aiSystemPrompt(ctx)
 
 	provider, err := h.selectProvider(req.Model)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	provider.SetSystemPrompt(systemPrompt)
-	provider.initMessages(systemPrompt, req.Message)
+	provider.SetSystemPrompt(h.aiSystemPrompt())
 
-	const maxIter = 6
-	var (
-		finalText   string
-		totalTokIn  int
-		totalTokOut int
-		iterations  int
-	)
+	byName := make(map[string]*mcp.Tool, len(h.Tools))
+	for i := range h.Tools {
+		byName[h.Tools[i].Name] = &h.Tools[i]
+	}
 
-	for i := 0; i < maxIter; i++ {
-		iterations = i + 1
+	hist := req.History
+	if len(hist) > 8 {
+		hist = hist[len(hist)-8:]
+	}
 
-		text, calls, tokIn, tokOut, done, callErr := provider.call(ctx, h.Tools)
-		totalTokIn += tokIn
-		totalTokOut += tokOut
+	msgs := provider.initMessages(hist, req.Message)
+	var finalText string
+	var actions []map[string]any
+	var totalIn, totalOut int
 
+	for i := 0; i < 6; i++ {
+		text, calls, tokIn, tokOut, done, callErr := provider.call(msgs, h.Tools)
 		if callErr != nil {
-			log.Printf("provider.call error (iter %d): %v", i, callErr)
-			finalText = fmt.Sprintf("[Error calling AI provider: %v]", callErr)
-			break
-		}
-
-		if done || len(calls) == 0 {
-			finalText = text
-			break
-		}
-
-		results := make([]toolResult, 0, len(calls))
-		for _, tc := range calls {
-			output, toolErr := executeToolCall(tc, h.Tools)
-			tr := toolResult{ID: tc.ID, Name: tc.Name, Output: output}
-			if toolErr != nil {
-				tr.IsErr = true
-				tr.Output = map[string]any{"error": toolErr.Error()}
+			errStr := callErr.Error()
+			if strings.Contains(errStr, "429") {
+				http.Error(w, "Model is rate-limited. Try again in a few seconds.", http.StatusTooManyRequests)
+			} else {
+				http.Error(w, fmt.Sprintf("AI error: %v", callErr), http.StatusInternalServerError)
 			}
-			results = append(results, tr)
+			return
 		}
-
-		provider.appendAssistant(text, calls)
-		provider.appendToolResults(results)
-
+		totalIn += tokIn
+		totalOut += tokOut
 		if text != "" {
 			finalText = text
 		}
+		if done || len(calls) == 0 {
+			break
+		}
+
+		results := make([]string, len(calls))
+		for j, tc := range calls {
+			tool, found := byName[tc.Name]
+			if !found {
+				results[j] = fmt.Sprintf(`{"error":"tool %s not found"}`, tc.Name)
+				continue
+			}
+			result, toolErr := tool.Handler(tc.Input)
+			if toolErr != nil {
+				results[j] = fmt.Sprintf(`{"error":"%s"}`, toolErr.Error())
+				continue
+			}
+			if rm, ok := result.(map[string]any); ok {
+				if action, ok := rm["_frontend_action"].(string); ok {
+					actions = append(actions, map[string]any{
+						"type": action,
+						"id":   rm["id"],
+					})
+				}
+			}
+			b, _ := json.Marshal(result)
+			results[j] = string(b)
+		}
+
+		msgs = provider.appendAssistant(msgs, text, calls)
+		msgs = provider.appendToolResults(msgs, calls, results)
 	}
 
-	failure := detectFailure(finalText)
-	go h.saveLog(provider.ModelID(), provider.Provider(), req.Message, finalText,
-		totalTokIn, totalTokOut, iterations, failure)
-
-	resp := chatResponse{
-		Reply:      finalText,
-		Model:      provider.ModelID(),
-		Provider:   provider.Provider(),
-		TokensIn:   totalTokIn,
-		TokensOut:  totalTokOut,
-		Iterations: iterations,
+	if finalText == "" {
+		finalText = "Done!"
 	}
+
+	go h.saveLog(req.Message, finalText, provider.ModelID(), provider.Provider(), totalIn, totalOut)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+	json.NewEncoder(w).Encode(chatResponse{
+		Text:      finalText,
+		Actions:   actions,
+		Model:     provider.ModelID(),
+		Provider:  provider.Provider(),
+		TokensIn:  totalIn,
+		TokensOut: totalOut,
+	})
 }
 
-func executeToolCall(tc toolCall, tools []mcp.Tool) (any, error) {
-	for _, t := range tools {
-		if t.Name == tc.Name {
-			return t.Handler(tc.Input)
-		}
+// POST /api/ai/chat/stream — Server-Sent Events with live status updates
+func (h *AIHandlers) chatStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming not supported", http.StatusInternalServerError)
+		return
 	}
-	return nil, fmt.Errorf("unknown tool: %s", tc.Name)
-}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
-func (h *AIHandlers) selectProvider(model string) (aiProvider, error) {
-	switch {
-	case strings.HasPrefix(model, "claude-"):
-		if h.AnthropicKey == "" {
-			return nil, fmt.Errorf("ANTHROPIC_API_KEY not configured")
-		}
-		return newAnthropicProvider(model, h.AnthropicKey), nil
-	case strings.HasPrefix(model, "gemini-"):
-		if h.GeminiKey == "" {
-			return nil, fmt.Errorf("GEMINI_API_KEY not configured")
-		}
-		return newGeminiProvider(model, h.GeminiKey), nil
-	default:
-		if h.OpenRouterKey == "" {
-			return nil, fmt.Errorf("OPENROUTER_API_KEY not configured")
-		}
-		return newOpenRouterProvider(model, h.OpenRouterKey), nil
+	send := func(v any) {
+		b, _ := json.Marshal(v)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		flusher.Flush()
 	}
-}
 
-func (h *AIHandlers) aiSystemPrompt(ctx context.Context) string {
-	base := `You are a helpful AI assistant with persistent memory.
-You can remember facts about the user using the remember() tool,
-search memory with recall(), and delete facts with forget().
-Always be concise and helpful.`
+	var req chatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		send(map[string]any{"error": "invalid request"})
+		return
+	}
+	if req.Message == "" {
+		send(map[string]any{"error": "message required"})
+		return
+	}
 
-	rows, err := h.DB.QueryContext(ctx,
-		`SELECT key, value FROM agent_memory ORDER BY updated_at DESC LIMIT 8`)
+	provider, err := h.selectProvider(req.Model)
 	if err != nil {
-		return base
+		send(map[string]any{"error": err.Error()})
+		return
 	}
-	defer rows.Close()
+	provider.SetSystemPrompt(h.aiSystemPrompt())
 
-	var facts []string
-	for rows.Next() {
-		var k, v string
-		if rows.Scan(&k, &v) == nil {
-			facts = append(facts, fmt.Sprintf("- %s: %s", k, v))
+	// Wire live status into the OpenRouter fallback chain.
+	if orP, ok := provider.(*openRouterProvider); ok {
+		orP.onStatus = func(s string) { send(map[string]any{"status": s}) }
+	} else {
+		send(map[string]any{"status": "Connecting to model..."})
+	}
+
+	hist := req.History
+	if len(hist) > 8 {
+		hist = hist[len(hist)-8:]
+	}
+
+	byName := make(map[string]*mcp.Tool, len(h.Tools))
+	for i := range h.Tools {
+		byName[h.Tools[i].Name] = &h.Tools[i]
+	}
+
+	msgs := provider.initMessages(hist, req.Message)
+	var finalText string
+	var actions []map[string]any
+	var totalIn, totalOut int
+
+	for i := 0; i < 6; i++ {
+		text, calls, tokIn, tokOut, done, callErr := provider.call(msgs, h.Tools)
+		if callErr != nil {
+			if strings.Contains(callErr.Error(), "429") {
+				send(map[string]any{"error": "Model is rate-limited. Try again in a few seconds."})
+			} else {
+				send(map[string]any{"error": fmt.Sprintf("AI error: %v", callErr)})
+			}
+			return
 		}
+		totalIn += tokIn
+		totalOut += tokOut
+		if text != "" {
+			finalText = text
+		}
+		if done || len(calls) == 0 {
+			break
+		}
+
+		results := make([]string, len(calls))
+		for j, tc := range calls {
+			if s, ok := toolStatusMessages[tc.Name]; ok {
+				send(map[string]any{"status": s})
+			}
+			tool, found := byName[tc.Name]
+			if !found {
+				results[j] = fmt.Sprintf(`{"error":"tool %s not found"}`, tc.Name)
+				continue
+			}
+			result, toolErr := tool.Handler(tc.Input)
+			if toolErr != nil {
+				results[j] = fmt.Sprintf(`{"error":"%s"}`, toolErr.Error())
+				continue
+			}
+			if rm, ok := result.(map[string]any); ok {
+				if action, ok := rm["_frontend_action"].(string); ok {
+					actions = append(actions, map[string]any{
+						"type": action,
+						"id":   rm["id"],
+					})
+				}
+			}
+			b, _ := json.Marshal(result)
+			results[j] = string(b)
+		}
+		msgs = provider.appendAssistant(msgs, text, calls)
+		msgs = provider.appendToolResults(msgs, calls, results)
 	}
-	if len(facts) == 0 {
-		return base
+
+	if finalText == "" {
+		finalText = "Done!"
 	}
-	return base + "\n\nBan nho ve user:\n" + strings.Join(facts, "\n")
+
+	go h.saveLog(req.Message, finalText, provider.ModelID(), provider.Provider(), totalIn, totalOut)
+
+	send(map[string]any{
+		"text":       finalText,
+		"actions":    actions,
+		"model":      provider.ModelID(),
+		"provider":   provider.Provider(),
+		"tokens_in":  totalIn,
+		"tokens_out": totalOut,
+	})
 }
 
+// GET /api/ai/memory
 func (h *AIHandlers) memoryList(w http.ResponseWriter, r *http.Request) {
+	if h.DB == nil {
+		http.Error(w, "no db", http.StatusServiceUnavailable)
+		return
+	}
 	rows, err := h.DB.QueryContext(r.Context(),
 		`SELECT key, value, updated_at FROM agent_memory ORDER BY updated_at DESC`)
 	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	defer rows.Close()
-
-	var entries []memoryEntry
-	for rows.Next() {
-		var e memoryEntry
-		if rows.Scan(&e.Key, &e.Value, &e.UpdatedAt) == nil {
-			entries = append(entries, e)
-		}
+	type fact struct {
+		Key       string `json:"key"`
+		Value     string `json:"value"`
+		UpdatedAt string `json:"updated_at"`
 	}
-	if entries == nil {
-		entries = []memoryEntry{}
+	var facts []fact
+	for rows.Next() {
+		var f fact
+		rows.Scan(&f.Key, &f.Value, &f.UpdatedAt)
+		facts = append(facts, f)
+	}
+	if facts == nil {
+		facts = []fact{}
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(entries)
+	json.NewEncoder(w).Encode(map[string]any{"facts": facts})
 }
 
+// PUT /api/ai/memory — bulk replace
 func (h *AIHandlers) memoryImport(w http.ResponseWriter, r *http.Request) {
-	var entries []memoryEntry
-	if err := json.NewDecoder(r.Body).Decode(&entries); err != nil {
-		http.Error(w, "invalid JSON", http.StatusBadRequest)
+	if h.DB == nil {
+		http.Error(w, "no db", http.StatusServiceUnavailable)
 		return
 	}
-
-	tx, err := h.DB.BeginTx(r.Context(), nil)
+	var body struct {
+		Facts []struct {
+			Key   string `json:"key"`
+			Value string `json:"value"`
+		} `json:"facts"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid json", http.StatusBadRequest)
+		return
+	}
+	tx, err := h.DB.Begin()
 	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	now := time.Now().UTC().Format(time.RFC3339)
-	for _, e := range entries {
-		if e.Key == "" {
+	defer tx.Rollback()
+	tx.Exec(`DELETE FROM agent_memory`)
+	for _, f := range body.Facts {
+		if strings.TrimSpace(f.Key) == "" {
 			continue
 		}
-		ts := e.UpdatedAt
-		if ts == "" {
-			ts = now
-		}
-		_, err := tx.ExecContext(r.Context(),
-			`INSERT INTO agent_memory(key,value,updated_at) VALUES(?,?,?)
-			 ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`,
-			e.Key, e.Value, ts,
-		)
-		if err != nil {
-			tx.Rollback()
-			http.Error(w, "db error on import", http.StatusInternalServerError)
-			return
-		}
+		tx.Exec(`INSERT INTO agent_memory (key, value, updated_at) VALUES (?, ?, ?)`,
+			strings.TrimSpace(f.Key), f.Value, time.Now().UTC().Format(time.RFC3339))
 	}
-
 	if err := tx.Commit(); err != nil {
-		http.Error(w, "commit error", http.StatusInternalServerError)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"imported": len(entries)})
+	json.NewEncoder(w).Encode(map[string]any{"ok": true, "imported": len(body.Facts)})
 }
 
+// DELETE /api/ai/memory/{key}
 func (h *AIHandlers) memoryDelete(w http.ResponseWriter, r *http.Request) {
-	if key := r.URL.Query().Get("key"); key != "" {
-		res, err := h.DB.ExecContext(r.Context(), `DELETE FROM agent_memory WHERE key = ?`, key)
-		if err != nil {
-			http.Error(w, "db error", http.StatusInternalServerError)
-			return
-		}
-		n, _ := res.RowsAffected()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]any{"deleted": n})
+	if h.DB == nil {
+		http.Error(w, "no db", http.StatusServiceUnavailable)
 		return
 	}
-
-	res, err := h.DB.ExecContext(r.Context(), `DELETE FROM agent_memory`)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "key required", http.StatusBadRequest)
 		return
 	}
-	n, _ := res.RowsAffected()
+	h.DB.ExecContext(r.Context(), `DELETE FROM agent_memory WHERE key = ?`, key)
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{"deleted": n})
+	json.NewEncoder(w).Encode(map[string]any{"ok": true})
 }
 
+// GET /api/ai/logs
 func (h *AIHandlers) logs(w http.ResponseWriter, r *http.Request) {
+	if h.DB == nil {
+		http.Error(w, "no db", http.StatusServiceUnavailable)
+		return
+	}
 	rows, err := h.DB.QueryContext(r.Context(),
-		`SELECT id, ts, model, provider, user_msg, reply, tok_in, tok_out, iterations, failure
+		`SELECT id, ts, model, provider, user_msg, reply, tok_in, tok_out, failure
 		 FROM chat_logs ORDER BY ts DESC LIMIT 100`)
 	if err != nil {
 		http.Error(w, "db error", http.StatusInternalServerError)
@@ -318,14 +414,22 @@ func (h *AIHandlers) logs(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rows.Close()
 
+	type logEntry struct {
+		ID       int64  `json:"id"`
+		TS       string `json:"ts"`
+		Model    string `json:"model"`
+		Provider string `json:"provider"`
+		UserMsg  string `json:"user_msg"`
+		Reply    string `json:"reply"`
+		TokIn    int    `json:"tok_in"`
+		TokOut   int    `json:"tok_out"`
+		Failure  bool   `json:"failure"`
+	}
 	var entries []logEntry
 	for rows.Next() {
 		var e logEntry
 		var failureInt int
-		if err := rows.Scan(&e.ID, &e.TS, &e.Model, &e.Provider,
-			&e.UserMsg, &e.Reply, &e.TokIn, &e.TokOut, &e.Iterations, &failureInt); err != nil {
-			continue
-		}
+		rows.Scan(&e.ID, &e.TS, &e.Model, &e.Provider, &e.UserMsg, &e.Reply, &e.TokIn, &e.TokOut, &failureInt)
 		e.Failure = failureInt == 1
 		entries = append(entries, e)
 	}
@@ -336,28 +440,46 @@ func (h *AIHandlers) logs(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(entries)
 }
 
-func (h *AIHandlers) saveLog(model, provider, userMsg, reply string,
-	tokIn, tokOut, iterations int, failure bool) {
-	failureInt := 0
-	if failure {
-		failureInt = 1
+func (h *AIHandlers) saveLog(userMsg, reply, model, provider string, tokIn, tokOut int) {
+	if h.DB == nil {
+		return
 	}
-	_, err := h.DB.Exec(
-		`INSERT INTO chat_logs(model,provider,user_msg,reply,tok_in,tok_out,iterations,failure)
-		 VALUES(?,?,?,?,?,?,?,?)`,
-		model, provider, userMsg, reply, tokIn, tokOut, iterations, failureInt,
+	h.DB.Exec(
+		`INSERT INTO chat_logs(model,provider,user_msg,reply,tok_in,tok_out,failure) VALUES(?,?,?,?,?,?,0)`,
+		model, provider, userMsg, reply, tokIn, tokOut,
 	)
-	if err != nil {
-		log.Printf("saveLog error: %v", err)
-	}
 }
 
-func detectFailure(reply string) bool {
-	lower := strings.ToLower(reply)
-	for _, m := range []string{"[error", "i cannot", "i'm unable", "an error occurred", "failed to"} {
-		if strings.Contains(lower, m) {
-			return true
+// selectProvider picks a provider based on model name prefix and available API keys.
+func (h *AIHandlers) selectProvider(model string) (aiProvider, error) {
+	if model == "" {
+		switch {
+		case h.AnthropicKey != "":
+			return &anthropicProvider{key: h.AnthropicKey, model: "claude-haiku-4-5-20251001"}, nil
+		case h.GeminiKey != "":
+			return &geminiProvider{key: h.GeminiKey, model: "gemini-2.0-flash"}, nil
+		case h.OpenRouterKey != "":
+			return &openRouterProvider{key: h.OpenRouterKey, model: "deepseek/deepseek-v4-flash:free"}, nil
+		default:
+			return nil, fmt.Errorf("no AI API key configured (set ANTHROPIC_API_KEY, GEMINI_API_KEY, or OPENROUTER_API_KEY)")
 		}
 	}
-	return false
+
+	switch {
+	case strings.HasPrefix(model, "claude-"):
+		if h.AnthropicKey == "" {
+			return nil, fmt.Errorf("ANTHROPIC_API_KEY not set")
+		}
+		return &anthropicProvider{key: h.AnthropicKey, model: model}, nil
+	case strings.HasPrefix(model, "gemini-"):
+		if h.GeminiKey == "" {
+			return nil, fmt.Errorf("GEMINI_API_KEY not set")
+		}
+		return &geminiProvider{key: h.GeminiKey, model: model}, nil
+	default:
+		if h.OpenRouterKey == "" {
+			return nil, fmt.Errorf("OPENROUTER_API_KEY not set for model %q", model)
+		}
+		return &openRouterProvider{key: h.OpenRouterKey, model: model}, nil
+	}
 }

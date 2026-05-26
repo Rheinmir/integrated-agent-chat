@@ -11,18 +11,18 @@ func NewRouter(h *AIHandlers) http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/api/ai/chat", withMethod(http.MethodPost, h.chat))
+	mux.HandleFunc("/api/ai/chat/stream", withMethod(http.MethodPost, h.chatStream))
 	mux.HandleFunc("/api/ai/memory", func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			h.memoryList(w, r)
 		case http.MethodPut:
 			h.memoryImport(w, r)
-		case http.MethodDelete:
-			h.memoryDelete(w, r)
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
+	mux.HandleFunc("/api/ai/memory/{key}", withMethod(http.MethodDelete, h.memoryDelete))
 	mux.HandleFunc("/api/ai/logs", withMethod(http.MethodGet, h.logs))
 	mux.Handle("/", spaHandler("./dist"))
 
@@ -39,16 +39,28 @@ func withMethod(method string, fn http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// corsWriter forwards http.Flusher so SSE works through the CORS middleware wrapper.
+type corsWriter struct {
+	http.ResponseWriter
+}
+
+func (cw corsWriter) Flush() {
+	if f, ok := cw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		cw := corsWriter{w}
+		cw.Header().Set("Access-Control-Allow-Origin", "*")
+		cw.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		cw.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
+			cw.WriteHeader(http.StatusNoContent)
 			return
 		}
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(cw, r)
 	})
 }
 

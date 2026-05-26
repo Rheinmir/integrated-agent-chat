@@ -228,3 +228,120 @@ if len(history) > maxHistory {
 Result: ~3000 tokens reduced to ~900 per request.
 
 > **Lesson:** Tool schemas are tokens. Every property-level `description` across 17 tools adds up on every request. Cap conversation history server-side — the client should not control how much context you pay for.
+
+---
+
+## Issue 10: SSE streaming silently broken — "streaming not supported"
+
+**What broke:** The `chatStream` handler called `w.(http.Flusher)` but the assertion always failed, so the endpoint returned HTTP 500 "streaming not supported" instead of SSE events.
+
+**Why:** Any middleware that wraps `http.ResponseWriter` in its own struct (e.g. `corsMiddleware`) hides the underlying concrete type. The Go HTTP server passes a `*http.response` which implements `http.Flusher`, but wrapping it in a plain struct drops that interface.
+
+**Fix:** Add an explicit `Flush()` method to every `ResponseWriter` wrapper in the middleware chain:
+```go
+type corsWriter struct {
+    http.ResponseWriter
+}
+
+func (cw corsWriter) Flush() {
+    if f, ok := cw.ResponseWriter.(http.Flusher); ok {
+        f.Flush()
+    }
+}
+```
+
+Also add the SSE-specific nginx block **before** the generic `/api/` block, since nginx evaluates location blocks in order:
+```nginx
+# SSE block must come first
+location /api/ai/chat/stream {
+    proxy_pass         http://backend:8080;
+    proxy_http_version 1.1;
+    proxy_buffering    off;
+    proxy_cache        off;
+    proxy_read_timeout 120s;
+}
+
+location /api/ {
+    # ... normal proxy config
+}
+```
+
+> **Lesson:** Any `http.ResponseWriter` wrapper used in middleware must explicitly forward `http.Flusher` (and `http.Hijacker` if WebSocket is needed). Failing to do this silently breaks SSE, streaming responses, and WebSocket upgrades. Check every middleware in the chain.
+
+---
+
+## Issue 11: Small/free models returning empty text after tool calls
+
+**What broke:** After calling a tool successfully, some models (particularly cheap free-tier ones) returned an empty string as their text response. The UI displayed "…" for nearly a minute with no feedback.
+
+**Why (two-part):**
+1. Some models interpret "call tools then respond" as two separate turns — they call the tool correctly but then yield an empty final response.
+2. The empty-text fallback in the handler was guarded by `if len(actions) > 0`, so it only triggered if the action was already extracted. Models that failed to produce any output never hit it.
+
+**Fix — two parts:**
+
+Part 1 — move the empty-text fallback **outside** the `len(actions) > 0` guard:
+```go
+// WRONG: fallback inside the actions guard
+if len(actions) > 0 && finalText == "" {
+    finalText = "Done!"
+}
+
+// CORRECT: fallback runs regardless
+if finalText == "" {
+    // try to synthesize a message from action data
+    for _, a := range actions {
+        if a["type"] == "play_track" {
+            title, _ := a["title"].(string)
+            if title != "" { finalText = "Now playing: " + title }
+        }
+    }
+    if finalText == "" { finalText = "Done!" }
+}
+```
+
+Part 2 — add a system prompt instruction:
+```
+After every tool call, ALWAYS write one sentence reporting the result to the user.
+Never return an empty response.
+```
+
+Part 3 — remove unreliable models from the fallback chain. If a model consistently returns empty text, remove it. It's not worth the tokens.
+
+> **Lesson:** Always add an empty-text safety net **outside** any conditional guard. A model that calls tools correctly but returns no text is a real failure mode, not a hypothetical one.
+
+---
+
+## Issue 12: OpenRouter free models rate-limiting on the very first request
+
+**What broke:** The default model (`deepseek/deepseek-v4-flash:free`) hit HTTP 429 on the first message of a new session. Users saw an error on every fresh conversation.
+
+**Why:** OpenRouter's free-tier models share a global rate limit across all accounts. Even a single request from a new user can hit it if another user was active seconds before.
+
+**Fix:** Build a fallback chain and wire live status into the UI so users see what's happening:
+```go
+var openRouterFallbacks = []string{
+    "deepseek/deepseek-v4-flash:free",   // try free first
+    "google/gemma-4-31b-it:free",
+    "google/gemma-4-26b-a4b-it:free",
+    "inclusionai/ling-2.6-flash",        // $0.01/1M tokens
+    "qwen/qwen3.5-9b",                   // $0.02/1M tokens
+    "deepseek/deepseek-v4-flash",        // $0.04/1M tokens — reliable
+}
+
+// In the provider's call() method, iterate candidates on 429/5xx:
+for i, candidate := range candidates {
+    if p.onStatus != nil {
+        if i == 0 {
+            p.onStatus("Connecting to model...")
+        } else {
+            p.onStatus(fmt.Sprintf("Previous model busy, trying %s...", shortModel(candidate)))
+        }
+    }
+    // ... make the HTTP call, break on 200, sleep+continue on 429/5xx
+}
+```
+
+The `onStatus` callback is injected from the `chatStream` handler so the UI receives live status events (`{"status": "..."}`) as SSE frames while the fallback chain runs.
+
+> **Lesson:** Never use a single free model as the default. Build a multi-tier fallback from day one: free models first (zero cost when they work), cheap paid as safety net. Add live status feedback so users know why there's a delay — silent waiting is the worst UX.
