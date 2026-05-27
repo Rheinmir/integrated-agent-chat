@@ -1,11 +1,18 @@
 ﻿package mcp
 
 import (
+	"crypto/rand"
 	"database/sql"
 	"fmt"
 	"strings"
 	"time"
 )
+
+func randomHexID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return fmt.Sprintf("%x", b)
+}
 
 // Tool is the unit of capability exposed to the AI model.
 type Tool struct {
@@ -22,6 +29,9 @@ func NewRegistry(db *sql.DB) []Tool {
 		rememberTool(db),
 		recallTool(db),
 		forgetTool(db),
+		createPlaylistTool(db),
+		addToPlaylistTool(db),
+		playPlaylistTool(db),
 		searchTool(db),
 	}
 }
@@ -185,6 +195,107 @@ func searchTool(db *sql.DB) Tool {
 				results = append(results, map[string]string{"key": k, "value": v})
 			}
 			return map[string]any{"results": results, "count": len(results)}, nil
+		},
+	}
+}
+
+func createPlaylistTool(db *sql.DB) Tool {
+	return Tool{
+		Name:        "create_playlist",
+		Description: "Create a new playlist. Returns playlist id — this is NOT a track id, do NOT pass it to play_track.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"name": map[string]any{"type": "string"},
+			},
+			"required": []string{"name"},
+		},
+		Handler: func(args map[string]any) (any, error) {
+			name, _ := args["name"].(string)
+			name = strings.TrimSpace(name)
+			if name == "" {
+				return nil, fmt.Errorf("name required")
+			}
+			id := randomHexID()
+			_, err := db.Exec(`INSERT INTO playlists (id, name) VALUES (?, ?)`, id, name)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"id": id, "name": name}, nil
+		},
+	}
+}
+
+func addToPlaylistTool(db *sql.DB) Tool {
+	return Tool{
+		Name:        "add_to_playlist",
+		Description: "Add track to playlist. track_id must come from search_music or list_tracks, NOT from create_playlist.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"playlist_id": map[string]any{"type": "string"},
+				"track_id":    map[string]any{"type": "string"},
+			},
+			"required": []string{"playlist_id", "track_id"},
+		},
+		Handler: func(args map[string]any) (any, error) {
+			pid, _ := args["playlist_id"].(string)
+			tid, _ := args["track_id"].(string)
+			if pid == "" || tid == "" {
+				return nil, fmt.Errorf("playlist_id and track_id required")
+			}
+			var pos int
+			_ = db.QueryRow(`SELECT COALESCE(MAX(position),0)+1 FROM playlist_tracks WHERE playlist_id=?`, pid).Scan(&pos)
+			_, err := db.Exec(`INSERT OR IGNORE INTO playlist_tracks (playlist_id, track_id, position) VALUES (?,?,?)`, pid, tid, pos)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"ok": true}, nil
+		},
+	}
+}
+
+func playPlaylistTool(db *sql.DB) Tool {
+	return Tool{
+		Name:        "play_playlist",
+		Description: "Play first track of a playlist by playlist_id. Use after create_playlist + add_to_playlist.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"playlist_id": map[string]any{"type": "string"},
+			},
+			"required": []string{"playlist_id"},
+		},
+		Handler: func(args map[string]any) (any, error) {
+			pid, _ := args["playlist_id"].(string)
+			if pid == "" {
+				return nil, fmt.Errorf("playlist_id required")
+			}
+			var trackID, albumID, title, artist string
+			var durS int
+			err := db.QueryRow(
+				`SELECT t.id, t.album_id, t.title, ar.name, COALESCE(t.duration_s,0)
+				 FROM playlist_tracks pt
+				 JOIN tracks t ON t.id = pt.track_id
+				 JOIN albums al ON al.id = t.album_id
+				 JOIN artists ar ON ar.id = al.artist_id
+				 WHERE pt.playlist_id = ?
+				 ORDER BY pt.position ASC LIMIT 1`, pid).
+				Scan(&trackID, &albumID, &title, &artist, &durS)
+			if err == sql.ErrNoRows {
+				return nil, fmt.Errorf("playlist is empty — add tracks first with add_to_playlist")
+			}
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{
+				"_frontend_action": "play_track",
+				"id":               trackID,
+				"title":            title,
+				"artist":           artist,
+				"album_id":         albumID,
+				"duration_s":       durS,
+			}, nil
 		},
 	}
 }
